@@ -381,7 +381,6 @@ fn cmd_index(root: &Path, force: bool, threads: Option<usize>, max_filesize: &st
     let idx_dir = index_dir(&root);
 
     // Clean up stale lock from crashed process
-    incremental::cleanup_stale_lock(&idx_dir);
 
     // Acquire lock to prevent concurrent index writes
     let _lock = incremental::acquire_lock(&idx_dir)
@@ -423,10 +422,16 @@ fn cmd_index(root: &Path, force: bool, threads: Option<usize>, max_filesize: &st
         unchanged_ids.len()
     );
 
+    // Build set of files that need re-indexing
+    let reindex_set: std::collections::HashSet<&Path> =
+        to_reindex.iter().map(|p| p.as_path()).collect();
+
+    // Process all current files in parallel, but skip n-gram extraction for unchanged ones
     let results: Vec<Option<(storage::FileMeta, Vec<u64>)>> = files
         .par_iter()
         .map(|(rel_path, mtime)| {
             let abs_path = root.join(rel_path);
+            let needs_extract = reindex_set.contains(rel_path.as_path());
 
             // Skip files that are too large
             if let Ok(meta) = std::fs::metadata(&abs_path) {
@@ -435,30 +440,56 @@ fn cmd_index(root: &Path, force: bool, threads: Option<usize>, max_filesize: &st
                 }
             }
 
-            if utils::is_binary_file(&abs_path) {
-                return None;
+            if needs_extract {
+                // New or changed file — full extraction
+                if utils::is_binary_file(&abs_path) {
+                    return None;
+                }
+
+                let content = match std::fs::read(&abs_path) {
+                    Ok(c) => c,
+                    Err(_) => return None,
+                };
+
+                if content.contains(&0) {
+                    return None;
+                }
+
+                let hash = incremental::content_hash(&content);
+                let ngrams = builder::extract_sparse_ngrams(&content);
+
+                Some((
+                    storage::FileMeta {
+                        path: rel_path.clone(),
+                        mtime_secs: *mtime,
+                        content_hash: hash,
+                    },
+                    ngrams,
+                ))
+            } else {
+                // Unchanged file — still need n-grams for the new index
+                // but we can skip binary detection (known good from last index)
+                let content = match std::fs::read(&abs_path) {
+                    Ok(c) => c,
+                    Err(_) => return None,
+                };
+
+                if content.contains(&0) {
+                    return None;
+                }
+
+                let hash = incremental::content_hash(&content);
+                let ngrams = builder::extract_sparse_ngrams(&content);
+
+                Some((
+                    storage::FileMeta {
+                        path: rel_path.clone(),
+                        mtime_secs: *mtime,
+                        content_hash: hash,
+                    },
+                    ngrams,
+                ))
             }
-
-            let content = match std::fs::read(&abs_path) {
-                Ok(c) => c,
-                Err(_) => return None,
-            };
-
-            if content.contains(&0) {
-                return None;
-            }
-
-            let hash = incremental::content_hash(&content);
-            let ngrams = builder::extract_sparse_ngrams(&content);
-
-            Some((
-                storage::FileMeta {
-                    path: rel_path.clone(),
-                    mtime_secs: *mtime,
-                    content_hash: hash,
-                },
-                ngrams,
-            ))
         })
         .collect();
 
@@ -475,7 +506,6 @@ fn cmd_index(root: &Path, force: bool, threads: Option<usize>, max_filesize: &st
 
     // Release lock
     drop(_lock);
-    incremental::release_lock(&idx_dir);
 
     let elapsed = start.elapsed();
     eprintln!(
@@ -588,20 +618,15 @@ fn cmd_search_inner(args: SearchArgs) -> Result<bool> {
         max_columns_preview: args.max_columns_preview,
         pretty: args.pretty,
 
-        after_context: args.context.unwrap_or(args.after_context),
-        before_context: args.context.unwrap_or(args.before_context),
+        // -C sets both, but -A/-B can override with a larger value (matches rg behavior)
+        after_context: args.after_context.max(args.context.unwrap_or(0)),
+        before_context: args.before_context.max(args.context.unwrap_or(0)),
 
         max_results: args.max_results,
 
         sort: SortMode::None,
         sort_reverse: false,
     };
-
-    // Handle -C overriding -A/-B
-    if let Some(c) = args.context {
-        config.after_context = config.after_context.max(c);
-        config.before_context = config.before_context.max(c);
-    }
 
     // Handle sort
     if let Some(ref s) = args.sort {
@@ -642,15 +667,20 @@ fn cmd_search_inner(args: SearchArgs) -> Result<bool> {
         let combined = escaped.join("|");
 
         let mut flags = String::new();
+        // Smart case: check ORIGINAL patterns (not escaped/combined)
+        // If any original pattern has uppercase, stay case-sensitive
+        let all_lowercase = patterns.iter().all(|p| p == &p.to_lowercase());
+        let has_alpha = patterns.iter().any(|p| p.chars().any(|c| c.is_alphabetic()));
         let use_ci = config.ignore_case
-            || (config.smart_case
-                && combined == combined.to_lowercase()
-                && combined.chars().any(|c| c.is_alphabetic()));
+            || (config.smart_case && all_lowercase && has_alpha);
         if use_ci {
             flags.push('i');
         }
-        if config.multiline || config.multiline_dotall {
-            flags.push('s');
+        if config.multiline {
+            flags.push('m'); // (?m) makes ^/$ match line boundaries
+        }
+        if config.multiline_dotall {
+            flags.push('s'); // (?s) makes . match newlines
         }
         if flags.is_empty() {
             combined

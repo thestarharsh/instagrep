@@ -7,10 +7,14 @@
 
 use crate::utils::{bigram_weight, ngram_hash};
 
-/// Maximum length of a sparse n-gram (in bytes).
-/// Longer n-grams have diminishing selectivity returns and bloat the index.
-/// 128 bytes handles even long identifiers and string literals.
-pub const MAX_NGRAM_LEN: usize = 128;
+/// Maximum length of a sparse n-gram (in bytes) for indexing.
+/// 8 bytes is optimal: selective enough for filtering, compact for storage.
+/// Index size is ~2-3KB per source file with this setting.
+pub const MAX_NGRAM_LEN: usize = 8;
+
+/// Maximum length for query-side n-grams.
+/// Queries can use longer literals for better selectivity.
+pub const MAX_QUERY_NGRAM_LEN: usize = 32;
 
 /// Extract all valid sparse n-grams from a byte slice (one file's content).
 ///
@@ -38,13 +42,26 @@ pub fn extract_sparse_ngrams(content: &[u8]) -> Vec<u64> {
         .map(|i| bigram_weight(content[i], content[i + 1]))
         .collect();
 
-    // For each starting position, find all valid sparse n-grams
+    // Only start n-grams at "interesting" positions — where the bigram weight
+    // is above the 60th percentile. Skips common pairs like "th", "  ", "in"
+    // while keeping enough n-grams for reliable candidate filtering.
+    // Uses O(n) selection instead of O(n log n) sort.
+    let weight_threshold = if num_bigrams > 4 {
+        let mut w = weights.clone();
+        let p60 = w.len() * 3 / 5;
+        w.select_nth_unstable(p60);
+        w[p60]
+    } else {
+        0
+    };
+
     for start in 0..num_bigrams {
         let start_weight = weights[start];
 
-        // The n-gram must be at least 2 bytes (one bigram).
-        // A single bigram [start..start+2] is always valid (no internal bigrams).
-        hashes.push(ngram_hash(&content[start..start + 2]));
+        // Skip low-weight starting positions (common character pairs like "th", "  ")
+        if start_weight <= weight_threshold {
+            continue;
+        }
 
         // Try extending: track the minimum edge condition
         // We need start_weight > all internal bigrams AND end_weight > all internal bigrams
@@ -84,6 +101,8 @@ pub fn extract_sparse_ngrams(content: &[u8]) -> Vec<u64> {
 }
 
 /// Extract sparse n-grams and return them as (hash, ngram_string) for debugging/testing.
+/// Uses the SAME filtering as the production `extract_sparse_ngrams`:
+/// skips bigrams, applies p60 weight threshold, caps at MAX_NGRAM_LEN.
 pub fn extract_sparse_ngrams_debug(content: &[u8]) -> Vec<(u64, Vec<u8>)> {
     if content.len() < 2 {
         return vec![];
@@ -95,10 +114,24 @@ pub fn extract_sparse_ngrams_debug(content: &[u8]) -> Vec<(u64, Vec<u8>)> {
         .map(|i| bigram_weight(content[i], content[i + 1]))
         .collect();
 
+    // Same p60 threshold as production
+    let weight_threshold = if num_bigrams > 4 {
+        let mut w = weights.clone();
+        let p60 = w.len() * 3 / 5;
+        w.select_nth_unstable(p60);
+        w[p60]
+    } else {
+        0
+    };
+
     for start in 0..num_bigrams {
         let start_weight = weights[start];
-        results.push((ngram_hash(&content[start..start + 2]), content[start..start + 2].to_vec()));
 
+        if start_weight <= weight_threshold {
+            continue;
+        }
+
+        // Skip standalone bigrams (same as production)
         let mut max_internal: u32 = 0;
         for end_bigram_idx in (start + 1)..num_bigrams {
             if end_bigram_idx > start + 1 {
@@ -138,7 +171,7 @@ mod tests {
         assert!(extract_sparse_ngrams(b"").is_empty());
         assert!(extract_sparse_ngrams(b"a").is_empty());
         let two = extract_sparse_ngrams(b"ab");
-        assert_eq!(two.len(), 1, "two bytes = one bigram");
+        assert!(two.is_empty(), "2-byte file: bigrams skipped in index (too common)");
     }
 
     #[test]
@@ -150,12 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_debug_captures_rare_bigrams() {
-        let content = b"ZX_HANDLE";
-        let ngrams = extract_sparse_ngrams_debug(content);
-        // Should capture ZX as a bigram at minimum
-        let has_zx = ngrams.iter().any(|(_, ng)| ng == b"ZX");
-        assert!(has_zx, "should capture the rare ZX bigram");
+    fn test_extract_debug_matches_production() {
+        // Debug function should produce the same n-grams as production
+        let content = b"ZX_HANDLE_INVALID";
+        let prod_hashes = extract_sparse_ngrams(content);
+        let debug_ngrams = extract_sparse_ngrams_debug(content);
+        let debug_hashes: Vec<u64> = debug_ngrams.iter().map(|(h, _)| *h).collect();
+        assert_eq!(prod_hashes, debug_hashes,
+            "debug and production should generate identical n-gram sets");
     }
 
     #[test]

@@ -17,7 +17,14 @@ use std::path::{Path, PathBuf};
 /// Override with INSTAGREP_CACHE_DIR env var.
 pub fn index_dir_for(root: &Path) -> PathBuf {
     if let Ok(custom) = std::env::var("INSTAGREP_CACHE_DIR") {
-        return PathBuf::from(custom);
+        // Still need per-project subdirectory — otherwise all projects share one index
+        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let hash = utils::ngram_hash(canonical.to_string_lossy().as_bytes());
+        let dir_name = canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "root".to_string());
+        return PathBuf::from(custom).join(format!("{:016x}-{}", hash, dir_name));
     }
 
     let home = std::env::var("HOME")
@@ -30,16 +37,8 @@ pub fn index_dir_for(root: &Path) -> PathBuf {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let path_str = canonical.to_string_lossy();
 
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let build = ahash::RandomState::with_seeds(
-        0x517cc1b727220a95,
-        0x6c62272e07bb0142,
-        0x8db2d5cf3eef2f74,
-        0x62d1ce1e6b3b0a5a,
-    );
-    let mut hasher = build.build_hasher();
-    path_str.hash(&mut hasher);
-    let hash = hasher.finish();
+    // FNV-1a 64-bit — stable across all versions/platforms
+    let hash = utils::ngram_hash(path_str.as_bytes());
 
     let dir_name = canonical
         .file_name()

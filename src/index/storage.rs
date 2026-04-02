@@ -1,9 +1,9 @@
 //! Index storage: postings file + mmap-able lookup table.
 //!
-//! On-disk layout:
-//!   .instagrep/
-//!     postings.bin  — concatenated posting lists (each entry is a u32 file ID)
-//!     lookup.bin    — sorted array of (ngram_hash: u64, offset: u64, length: u32)
+//! On-disk layout (v2 — varint-compressed posting lists):
+//!   ~/.instagrep/indexes/<hash>/
+//!     postings.bin  — delta-encoded, varint-compressed posting lists
+//!     lookup.bin    — sorted array of (ngram_hash: u64, offset: u64, byte_len: u32)
 //!     files.bin     — serialized file metadata (path, mtime, content hash)
 //!     meta.bin      — index metadata (git commit, timestamp, version)
 
@@ -15,8 +15,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const INDEX_VERSION: u32 = 1;
-const LOOKUP_ENTRY_SIZE: usize = 20; // 8 (hash) + 8 (offset) + 4 (length)
+const INDEX_VERSION: u32 = 2; // v2: varint-compressed posting lists
+const LOOKUP_ENTRY_SIZE: usize = 20; // 8 (hash) + 8 (offset) + 4 (byte_len)
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FileMeta {
@@ -33,7 +33,66 @@ pub struct IndexMeta {
     pub timestamp: u64,
 }
 
-/// Builder for creating the index on disk.
+// ── Varint encoding/decoding ──────────────────────────────────────────
+
+/// Encode a u32 as a variable-length integer (1-5 bytes).
+/// Uses 7 bits of payload per byte, high bit = continuation.
+fn encode_varint(mut val: u32, buf: &mut Vec<u8>) {
+    while val >= 0x80 {
+        buf.push((val as u8) | 0x80);
+        val >>= 7;
+    }
+    buf.push(val as u8);
+}
+
+/// Decode a varint from a byte slice. Returns (value, bytes_consumed).
+/// On malformed input (>5 continuation bytes), logs a warning and returns
+/// what was decoded so far — never panics.
+fn decode_varint(bytes: &[u8]) -> (u32, usize) {
+    let mut result: u32 = 0;
+    let mut shift: u32 = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        result |= ((byte & 0x7F) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return (result, i + 1);
+        }
+        shift += 7;
+        if shift >= 35 {
+            log::warn!("Malformed varint at byte {} (corrupt index?)", i);
+            return (result, i + 1);
+        }
+    }
+    (result, bytes.len())
+}
+
+/// Delta-encode + varint-compress a sorted list of file IDs.
+fn compress_posting_list(ids: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(ids.len()); // typically smaller than input
+    let mut prev = 0u32;
+    for &id in ids {
+        let delta = id - prev;
+        encode_varint(delta, &mut buf);
+        prev = id;
+    }
+    buf
+}
+
+/// Decompress a delta-encoded varint posting list back to file IDs.
+fn decompress_posting_list(bytes: &[u8]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    let mut pos = 0;
+    let mut current = 0u32;
+    while pos < bytes.len() {
+        let (delta, consumed) = decode_varint(&bytes[pos..]);
+        current += delta;
+        ids.push(current);
+        pos += consumed;
+    }
+    ids
+}
+
+// ── Writer ────────────────────────────────────────────────────────────
+
 pub struct IndexWriter {
     index_dir: PathBuf,
 }
@@ -46,9 +105,6 @@ impl IndexWriter {
         })
     }
 
-    /// Write the complete index atomically.
-    /// `file_ngrams`: for each file ID, the set of ngram hashes.
-    /// `file_metas`: metadata for each file.
     pub fn write(
         &self,
         file_ngrams: &[Vec<u64>],
@@ -63,32 +119,28 @@ impl IndexWriter {
             }
         }
 
-        // Sort posting lists for better intersection performance
+        // Sort and dedup posting lists
         for list in inverted.values_mut() {
             list.sort_unstable();
             list.dedup();
         }
 
-        // Write postings file and build lookup entries
+        // Write compressed postings file
         let postings_path = self.index_dir.join("postings.bin.tmp");
         let mut postings_file = File::create(&postings_path)?;
         let mut lookup_entries: Vec<(u64, u64, u32)> = Vec::with_capacity(inverted.len());
         let mut offset: u64 = 0;
 
-        // Sort by hash for binary search
         let mut sorted_ngrams: Vec<u64> = inverted.keys().copied().collect();
         sorted_ngrams.sort_unstable();
 
         for hash in &sorted_ngrams {
             let posting_list = &inverted[hash];
-            let bytes: Vec<u8> = posting_list
-                .iter()
-                .flat_map(|&id| id.to_le_bytes())
-                .collect();
-            postings_file.write_all(&bytes)?;
-            let len = posting_list.len() as u32;
-            lookup_entries.push((*hash, offset, len));
-            offset += bytes.len() as u64;
+            let compressed = compress_posting_list(posting_list);
+            postings_file.write_all(&compressed)?;
+            let byte_len = compressed.len() as u32;
+            lookup_entries.push((*hash, offset, byte_len));
+            offset += byte_len as u64;
         }
         postings_file.flush()?;
         drop(postings_file);
@@ -96,10 +148,10 @@ impl IndexWriter {
         // Write lookup table
         let lookup_path = self.index_dir.join("lookup.bin.tmp");
         let mut lookup_file = File::create(&lookup_path)?;
-        for (hash, off, len) in &lookup_entries {
+        for (hash, off, byte_len) in &lookup_entries {
             lookup_file.write_all(&hash.to_le_bytes())?;
             lookup_file.write_all(&off.to_le_bytes())?;
-            lookup_file.write_all(&len.to_le_bytes())?;
+            lookup_file.write_all(&byte_len.to_le_bytes())?;
         }
         lookup_file.flush()?;
         drop(lookup_file);
@@ -133,7 +185,8 @@ impl IndexWriter {
     }
 }
 
-/// Reader for querying the mmap'd index.
+// ── Reader ────────────────────────────────────────────────────────────
+
 pub struct IndexReader {
     lookup_mmap: Mmap,
     postings_mmap: Mmap,
@@ -144,8 +197,8 @@ pub struct IndexReader {
 
 impl IndexReader {
     pub fn open(index_dir: &Path) -> Result<Self> {
-        let lookup_file =
-            File::open(index_dir.join("lookup.bin")).context("No index found. Run `instagrep index .` first.")?;
+        let lookup_file = File::open(index_dir.join("lookup.bin"))
+            .context("No index found. Run `instagrep index .` first.")?;
         let postings_file = File::open(index_dir.join("postings.bin"))?;
         let files_data = fs::read(index_dir.join("files.bin"))?;
         let meta_data = fs::read(index_dir.join("meta.bin"))?;
@@ -166,23 +219,23 @@ impl IndexReader {
     }
 
     /// Binary search the lookup table for an ngram hash.
-    /// Returns the posting list (file IDs) if found.
+    /// Decompresses the varint-encoded posting list on the fly.
     pub fn lookup(&self, ngram_hash: u64) -> Option<Vec<u32>> {
         if self.num_entries == 0 {
             return None;
         }
 
-        // Binary search on sorted lookup table
         let mut lo = 0usize;
         let mut hi = self.num_entries;
 
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let entry_offset = mid * LOOKUP_ENTRY_SIZE;
+
+            // Safe reads — return None on corrupt/truncated index instead of panicking
             let hash = u64::from_le_bytes(
-                self.lookup_mmap[entry_offset..entry_offset + 8]
-                    .try_into()
-                    .unwrap(),
+                self.lookup_mmap.get(entry_offset..entry_offset + 8)?
+                    .try_into().ok()?,
             );
 
             match hash.cmp(&ngram_hash) {
@@ -190,31 +243,17 @@ impl IndexReader {
                 std::cmp::Ordering::Greater => hi = mid,
                 std::cmp::Ordering::Equal => {
                     let postings_offset = u64::from_le_bytes(
-                        self.lookup_mmap[entry_offset + 8..entry_offset + 16]
-                            .try_into()
-                            .unwrap(),
+                        self.lookup_mmap.get(entry_offset + 8..entry_offset + 16)?
+                            .try_into().ok()?,
                     ) as usize;
-                    let count = u32::from_le_bytes(
-                        self.lookup_mmap[entry_offset + 16..entry_offset + 20]
-                            .try_into()
-                            .unwrap(),
+                    let byte_len = u32::from_le_bytes(
+                        self.lookup_mmap.get(entry_offset + 16..entry_offset + 20)?
+                            .try_into().ok()?,
                     ) as usize;
 
-                    let byte_len = count * 4;
-                    if postings_offset + byte_len > self.postings_mmap.len() {
-                        return None;
-                    }
-
-                    let file_ids: Vec<u32> = (0..count)
-                        .map(|i| {
-                            let off = postings_offset + i * 4;
-                            u32::from_le_bytes(
-                                self.postings_mmap[off..off + 4].try_into().unwrap(),
-                            )
-                        })
-                        .collect();
-
-                    return Some(file_ids);
+                    let compressed = self.postings_mmap
+                        .get(postings_offset..postings_offset + byte_len)?;
+                    return Some(decompress_posting_list(compressed));
                 }
             }
         }
@@ -222,18 +261,15 @@ impl IndexReader {
         None
     }
 
-    /// Return total number of indexed files.
     pub fn num_files(&self) -> usize {
         self.file_metas.len()
     }
 
-    /// Return total number of distinct n-gram entries.
     pub fn num_ngrams(&self) -> usize {
         self.num_entries
     }
 }
 
-/// Check if an index exists at the given directory.
 pub fn index_exists(index_dir: &Path) -> bool {
     index_dir.join("lookup.bin").exists()
         && index_dir.join("postings.bin").exists()
@@ -244,6 +280,44 @@ pub fn index_exists(index_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_varint_roundtrip() {
+        for val in [0, 1, 127, 128, 255, 256, 16383, 16384, u32::MAX] {
+            let mut buf = Vec::new();
+            encode_varint(val, &mut buf);
+            let (decoded, consumed) = decode_varint(&buf);
+            assert_eq!(decoded, val, "varint roundtrip failed for {}", val);
+            assert_eq!(consumed, buf.len());
+        }
+    }
+
+    #[test]
+    fn test_posting_list_compression_roundtrip() {
+        let ids = vec![0, 5, 10, 100, 500, 10000];
+        let compressed = compress_posting_list(&ids);
+        let decompressed = decompress_posting_list(&compressed);
+        assert_eq!(decompressed, ids);
+        // Compressed should be much smaller than 6 * 4 = 24 bytes
+        assert!(compressed.len() < 24, "compressed={} should be < 24", compressed.len());
+    }
+
+    #[test]
+    fn test_posting_list_single_entry() {
+        let ids = vec![42];
+        let compressed = compress_posting_list(&ids);
+        let decompressed = decompress_posting_list(&compressed);
+        assert_eq!(decompressed, ids);
+    }
+
+    #[test]
+    fn test_posting_list_empty() {
+        let ids: Vec<u32> = vec![];
+        let compressed = compress_posting_list(&ids);
+        assert!(compressed.is_empty());
+        let decompressed = decompress_posting_list(&compressed);
+        assert!(decompressed.is_empty());
+    }
 
     #[test]
     fn test_roundtrip_write_read() {
@@ -293,5 +367,20 @@ mod tests {
 
         // Non-existent hash
         assert!(reader.lookup(999).is_none());
+    }
+
+    #[test]
+    fn test_compression_ratio() {
+        // Simulate a posting list with 100 sequential file IDs
+        let ids: Vec<u32> = (0..100).collect();
+        let compressed = compress_posting_list(&ids);
+        let raw_size = ids.len() * 4; // 400 bytes uncompressed
+        // Delta of 1 each → varint of 1 → 1 byte each = ~100 bytes
+        assert!(
+            compressed.len() < raw_size / 3,
+            "compressed {} should be < {} (1/3 of raw)",
+            compressed.len(),
+            raw_size / 3
+        );
     }
 }

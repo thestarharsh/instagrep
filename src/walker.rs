@@ -111,7 +111,7 @@ pub fn collect_files(config: &WalkConfig) -> Vec<PathBuf> {
     let walker = builder
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            name != ".git"
+            name != ".git" && name != ".instagrep"
         })
         .build();
 
@@ -194,8 +194,8 @@ pub fn filter_candidates(
                             return false;
                         }
                     }
-                    ignore::Match::Ignore(_) => return true,
-                    ignore::Match::Whitelist(_) => return true,
+                    ignore::Match::Ignore(_) => return false,   // override says exclude
+                    ignore::Match::Whitelist(_) => return true, // override says include
                 }
             }
 

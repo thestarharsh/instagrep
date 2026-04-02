@@ -60,17 +60,19 @@ pub fn bigram_weight(a: u8, b: u8) -> u32 {
 }
 
 /// Hash an n-gram to a 64-bit key for the lookup table.
+///
+/// Uses FNV-1a: simple, fast, and stable across all platforms/versions.
+/// This hash is persisted to disk in the index, so it must NEVER change.
 pub fn ngram_hash(ngram: &[u8]) -> u64 {
-    use std::hash::{BuildHasher, Hash, Hasher};
-    let build = ahash::RandomState::with_seeds(
-        0x517cc1b727220a95,
-        0x6c62272e07bb0142,
-        0x8db2d5cf3eef2f74,
-        0x62d1ce1e6b3b0a5a,
-    );
-    let mut hasher = build.build_hasher();
-    ngram.hash(&mut hasher);
-    hasher.finish()
+    // FNV-1a 64-bit
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001B3;
+    let mut hash = FNV_OFFSET;
+    for &byte in ngram {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 #[cfg(test)]

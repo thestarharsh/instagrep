@@ -27,6 +27,7 @@ use instagrep::walker::{self, WalkConfig};
 pub struct SearchParams {
     /// Regex pattern
     pub pattern: String,
+    /// Subfolder to search within (e.g. "src/index"). Searches full project if omitted.
     #[serde(default)]
     pub path: Option<String>,
     /// e.g. "rust", "py", "js"
@@ -129,20 +130,6 @@ impl InstaGrepServer {
         }
     }
 
-    fn resolve_root(&self, path: Option<&str>) -> PathBuf {
-        match path {
-            Some(p) if !p.is_empty() => {
-                let pb = PathBuf::from(p);
-                if pb.is_absolute() {
-                    pb
-                } else {
-                    self.default_root.join(pb)
-                }
-            }
-            _ => self.default_root.clone(),
-        }
-    }
-
     fn idx_dir(root: &Path) -> PathBuf {
         instagrep::index_dir_for(root)
     }
@@ -159,9 +146,11 @@ impl InstaGrepServer {
 
     fn do_search(&self, params: &SearchParams) -> anyhow::Result<SearchResult> {
         let start = std::time::Instant::now();
-        let root = std::fs::canonicalize(self.resolve_root(params.path.as_deref()))
-            .context("Cannot resolve search path")?;
+        // Always use default_root for indexing — path is a subfolder filter
+        let root = std::fs::canonicalize(&self.default_root)
+            .context("Cannot resolve project root")?;
         let idx_dir = Self::idx_dir(&root);
+        let subfolder = params.path.as_deref().filter(|p| !p.is_empty());
         let max_results = params.max_results.unwrap_or(200);
         let context_lines = params.context_lines.unwrap_or(0);
         let ignore_case = params.ignore_case.unwrap_or(false);
@@ -225,6 +214,16 @@ impl InstaGrepServer {
             ..Default::default()
         };
         let filtered = walker::filter_candidates(&candidate_files, &root, &walk_config);
+
+        // Apply subfolder filter if path was specified
+        let filtered: Vec<PathBuf> = if let Some(sub) = subfolder {
+            filtered
+                .into_iter()
+                .filter(|p| p.starts_with(sub))
+                .collect()
+        } else {
+            filtered
+        };
 
         // Search
         let mut matches = Vec::new();
@@ -292,12 +291,12 @@ impl InstaGrepServer {
     }
 
     fn do_index(&self, params: &IndexParams) -> anyhow::Result<IndexResult> {
-        let root = std::fs::canonicalize(self.resolve_root(params.path.as_deref()))
-            .context("Cannot resolve index path")?;
+        // Always index from project root — one index per project
+        let root = std::fs::canonicalize(&self.default_root)
+            .context("Cannot resolve project root")?;
         let idx_dir = Self::idx_dir(&root);
         let force = params.force.unwrap_or(false);
 
-        incremental::cleanup_stale_lock(&idx_dir);
         let _lock = incremental::acquire_lock(&idx_dir)?;
 
         let start = std::time::Instant::now();
@@ -315,7 +314,6 @@ impl InstaGrepServer {
             incremental::detect_changes(&files, &prev_metas);
 
         if to_reindex.is_empty() && to_remove.is_empty() && !prev_metas.is_empty() {
-            incremental::release_lock(&idx_dir);
             return Ok(IndexResult {
                 files_indexed: unchanged_ids.len(),
                 elapsed_secs: start.elapsed().as_secs_f64(),
@@ -365,7 +363,6 @@ impl InstaGrepServer {
         writer.write(&file_ngrams, &file_metas, git_commit)?;
 
         drop(_lock);
-        incremental::release_lock(&idx_dir);
 
         Ok(IndexResult {
             files_indexed: file_metas.len(),
@@ -374,8 +371,8 @@ impl InstaGrepServer {
         })
     }
 
-    fn do_status(&self, params: &StatusParams) -> StatusResult {
-        let root = match std::fs::canonicalize(self.resolve_root(params.path.as_deref())) {
+    fn do_status(&self, _params: &StatusParams) -> StatusResult {
+        let root = match std::fs::canonicalize(&self.default_root) {
             Ok(r) => r,
             Err(_) => {
                 return StatusResult {
@@ -432,22 +429,23 @@ impl InstaGrepServer {
 impl InstaGrepServer {
     #[tool(
         name = "search",
-        description = "Fast indexed regex search. Returns file:line:text matches."
+        description = "Fast indexed regex search. Auto-indexes on first call. Just search — never call index first."
     )]
     async fn search_tool(&self, Parameters(params): Parameters<SearchParams>) -> String {
         // Auto-index if no index exists, auto-reindex if stale
-        let root_path = self.resolve_root(params.path.as_deref());
-        let idx_dir = Self::idx_dir(&root_path);
+        // Always index from project root, never from a subfolder
+        let root_path = &self.default_root;
+        let idx_dir = Self::idx_dir(root_path);
         let needs_index = if !storage::index_exists(&idx_dir) {
             true
         } else if let Ok(reader) = storage::IndexReader::open(&idx_dir) {
-            incremental::is_index_stale(reader.meta.git_commit.as_deref(), &root_path)
+            incremental::is_index_stale(reader.meta.git_commit.as_deref(), root_path)
         } else {
             true
         };
         if needs_index {
             let _ = self.do_index(&IndexParams {
-                path: params.path.clone(),
+                path: None,
                 force: Some(false),
             });
         }
@@ -467,7 +465,7 @@ impl InstaGrepServer {
 
     #[tool(
         name = "index",
-        description = "Build/update search index. Incremental by default."
+        description = "Rebuild search index. Only needed if search results seem stale. Search auto-indexes — you rarely need this."
     )]
     async fn index_tool(&self, Parameters(params): Parameters<IndexParams>) -> String {
         match self.do_index(&params) {
@@ -479,7 +477,7 @@ impl InstaGrepServer {
 
     #[tool(
         name = "status",
-        description = "Check index health: file count, staleness, disk size."
+        description = "Check index health. Search auto-indexes — you don't need to check status before searching."
     )]
     async fn status_tool(&self, Parameters(params): Parameters<StatusParams>) -> String {
         let result = self.do_status(&params);

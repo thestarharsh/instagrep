@@ -125,15 +125,30 @@ fn extract_covering_ngrams(literal: &[u8]) -> Vec<u64> {
         .map(|i| bigram_weight(literal[i], literal[i + 1]))
         .collect();
 
-    // Find all valid sparse n-grams (same algorithm as build_all)
+    // Generate n-grams matching the index: skip standalone bigrams,
+    // skip low-weight start positions (same threshold as builder).
     let mut ngrams: Vec<(u64, usize)> = Vec::new(); // (hash, length)
+
+    // Use same p60 threshold as the index builder
+    let weight_threshold = if num_bigrams > 4 {
+        let mut w = weights.clone();
+        let p60 = w.len() * 3 / 5;
+        w.select_nth_unstable(p60);
+        w[p60]
+    } else {
+        0
+    };
 
     for start in 0..num_bigrams {
         let start_weight = weights[start];
 
-        // Single bigram
-        ngrams.push((ngram_hash(&literal[start..start + 2]), 2));
+        // Skip low-weight positions (same as index builder)
+        if start_weight <= weight_threshold {
+            continue;
+        }
 
+        // Skip standalone bigrams (not stored in index)
+        // Only generate n-grams >= 3 bytes
         let mut max_internal: u32 = 0;
         for end_bigram_idx in (start + 1)..num_bigrams {
             if end_bigram_idx > start + 1 {
@@ -142,7 +157,7 @@ fn extract_covering_ngrams(literal: &[u8]) -> Vec<u64> {
             let end_weight = weights[end_bigram_idx];
             if start_weight > max_internal && end_weight > max_internal {
                 let len = end_bigram_idx + 2 - start;
-                if len <= crate::index::builder::MAX_NGRAM_LEN {
+                if len >= 3 && len <= crate::index::builder::MAX_NGRAM_LEN {
                     ngrams.push((ngram_hash(&literal[start..start + len]), len));
                 }
             }
@@ -257,11 +272,9 @@ fn find_candidates_inner(
         if let Some(list) = reader.lookup(*hash) {
             posting_lists.push(list);
         }
-        // If an n-gram is not in the index, it means NO file contains it,
-        // so the intersection would be empty
-        else {
-            return Some(vec![]);
-        }
+        // N-gram not in index: could mean no file has it, OR it was below
+        // the indexing weight threshold. Can't tell — skip this n-gram.
+        // If ALL n-grams are missing, we'll fall through to full scan.
     }
 
     if posting_lists.is_empty() {
@@ -390,9 +403,10 @@ mod tests {
 
     #[test]
     fn test_build_covering_short_literal() {
-        // 2-byte literal should produce exactly 1 covering n-gram
+        // 2-byte literal: bigrams are skipped (not in index), so 0 covering n-grams
+        // This correctly causes a full-scan fallback
         let covering = build_covering(&[b"ab".to_vec()]);
-        assert_eq!(covering.len(), 1);
+        assert!(covering.is_empty());
     }
 
     #[test]

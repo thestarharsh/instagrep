@@ -182,10 +182,10 @@ impl SearchConfig {
             flags.push('i');
         }
         if self.multiline {
-            flags.push('s');
+            flags.push('m'); // (?m) makes ^/$ match line boundaries
         }
         if self.multiline_dotall {
-            flags.push('s');
+            flags.push('s'); // (?s) makes . match newlines
         }
 
         if !flags.is_empty() {
@@ -264,19 +264,22 @@ pub fn search_file<W: Write>(
 
     // Count-only mode
     if config.count || config.count_matches {
-        let mut count = 0usize;
+        // Single-pass counting (avoids 3x iteration for invert_match)
+        let mut matching = 0usize;
+        let mut total = 0usize;
         for line in content.split(|&b| b == b'\n') {
+            total += 1;
             if config.count_matches {
-                count += re.find_iter(line).count();
+                matching += re.find_iter(line).count();
             } else if re.is_match(line) {
-                count += 1;
+                matching += 1;
             }
         }
-        if config.invert_match && config.count {
-            let total_lines = content.split(|&b| b == b'\n').count();
-            let matching = content.split(|&b| b == b'\n').filter(|l| re.is_match(l)).count();
-            count = total_lines - matching;
-        }
+        let count = if config.invert_match && config.count {
+            total - matching
+        } else {
+            matching
+        };
         if show_filename {
             if use_color {
                 write!(out, "\x1b[35m{}\x1b[0m:", path_str)?;
@@ -528,10 +531,17 @@ fn print_line<W: Write>(
 
     if config.column && is_match {
         if let Some(m) = re.find(line) {
-            if use_color {
-                write!(out, "\x1b[32m{}\x1b[0m{}", m.start() + 1, separator)?;
+            // When trimming, adjust column to be relative to trimmed output
+            let trim_offset = if config.trim {
+                line.len() - String::from_utf8_lossy(line).trim_start().len()
             } else {
-                write!(out, "{}{}", m.start() + 1, separator)?;
+                0
+            };
+            let col = m.start().saturating_sub(trim_offset) + 1;
+            if use_color {
+                write!(out, "\x1b[32m{}\x1b[0m{}", col, separator)?;
+            } else {
+                write!(out, "{}{}", col, separator)?;
             }
         }
     }
@@ -551,12 +561,19 @@ fn print_line<W: Write>(
         line_text.trim_end()
     };
 
-    // Max columns
+    // Max columns (safe for multi-byte UTF-8)
     if let Some(max_cols) = config.max_columns {
         if display_text.len() > max_cols {
             if config.max_columns_preview {
-                write!(out, "{}", &display_text[..max_cols])?;
-                writeln!(out, " [... {} more bytes]", display_text.len() - max_cols)?;
+                // Find safe char boundary at or before max_cols
+                let safe_end = display_text
+                    .char_indices()
+                    .take_while(|(i, _)| *i < max_cols)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                write!(out, "{}", &display_text[..safe_end])?;
+                writeln!(out, " [... {} more bytes]", display_text.len() - safe_end)?;
             } else {
                 writeln!(out, "[Omitted long line with {} bytes]", display_text.len())?;
             }
@@ -573,9 +590,12 @@ fn print_line<W: Write>(
         } else {
             // Highlight matches
             let mut last_end = 0;
+            // Byte offset of leading whitespace to skip in highlight loop.
+            // Both line.len() and trim_start().len() are byte counts, so the
+            // subtraction gives the correct byte offset even for multi-byte
+            // whitespace (e.g. U+00A0 non-breaking space = 2 bytes).
             let trimmed = if config.trim {
-                let trim_offset = line.len() - line_text.trim_start().len();
-                trim_offset
+                line.len() - line_text.trim_start().len()
             } else {
                 0
             };

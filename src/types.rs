@@ -1,9 +1,15 @@
 //! Built-in file type definitions, matching ripgrep's type system.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
-/// Returns the built-in file type map: type_name → list of glob patterns.
-pub fn builtin_type_map() -> HashMap<&'static str, &'static [&'static str]> {
+/// Returns the built-in file type map (initialized once, cached forever).
+pub fn builtin_type_map() -> &'static HashMap<&'static str, &'static [&'static str]> {
+    static MAP: OnceLock<HashMap<&str, &[&str]>> = OnceLock::new();
+    MAP.get_or_init(|| builtin_type_map_inner())
+}
+
+fn builtin_type_map_inner() -> HashMap<&'static str, &'static [&'static str]> {
     let mut m = HashMap::new();
     m.insert("agda", &["*.agda", "*.lagda"][..]);
     m.insert("aidl", &["*.aidl"][..]);
@@ -134,8 +140,8 @@ pub fn builtin_type_map() -> HashMap<&'static str, &'static [&'static str]> {
 /// Format the type list for display (matching `rg --type-list` output).
 pub fn format_type_list() -> String {
     let map = builtin_type_map();
-    let mut types: Vec<_> = map.into_iter().collect();
-    types.sort_by_key(|(name, _)| *name);
+    let mut types: Vec<_> = map.iter().collect();
+    types.sort_by_key(|(name, _)| **name);
 
     let mut out = String::new();
     for (name, globs) in types {

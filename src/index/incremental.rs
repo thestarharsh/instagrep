@@ -96,7 +96,7 @@ pub fn collect_files(root: &Path) -> Result<Vec<(PathBuf, i64)>> {
         .git_exclude(true)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            name != ".git"
+            name != ".git" && name != ".instagrep"
         })
         .build();
 
@@ -126,82 +126,27 @@ pub fn collect_files(root: &Path) -> Result<Vec<(PathBuf, i64)>> {
     Ok(files)
 }
 
-/// Acquire a lock file to prevent concurrent index writes.
-/// Returns the lock file handle (lock is held until dropped).
+/// Acquire an exclusive OS-level lock on the index directory.
+/// Uses flock(2) — automatically released when the file handle is dropped.
+/// If another process holds the lock, this blocks until it's available.
+/// No stale lock cleanup needed — OS releases on process exit/crash.
 pub fn acquire_lock(index_dir: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
     use std::fs::OpenOptions;
-    let lock_path = index_dir.join(".lock");
-    std::fs::create_dir_all(index_dir)?;
 
+    std::fs::create_dir_all(index_dir)?;
     let lock_file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
-        .open(&lock_path)
+        .open(index_dir.join(".lock"))
         .context("Failed to create lock file")?;
 
-    // Try to get exclusive access by writing our PID
-    use std::io::Write;
-    let mut f = lock_file;
-    writeln!(f, "{}", std::process::id())?;
-    f.flush()?;
+    lock_file
+        .lock_exclusive()
+        .context("Index is locked by another process")?;
 
-    Ok(f)
-}
-
-/// Release the lock file.
-pub fn release_lock(index_dir: &Path) {
-    let lock_path = index_dir.join(".lock");
-    let _ = std::fs::remove_file(lock_path);
-}
-
-/// Check if a stale lock exists (from a crashed process).
-/// Returns true if lock seems stale (process not running).
-pub fn is_lock_stale(index_dir: &Path) -> bool {
-    let lock_path = index_dir.join(".lock");
-    if !lock_path.exists() {
-        return false;
-    }
-
-    // Read PID from lock file
-    if let Ok(content) = std::fs::read_to_string(&lock_path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            // Check if process is still running (Unix-specific but safe to try)
-            #[cfg(unix)]
-            {
-                use std::process::Command;
-                let result = Command::new("kill")
-                    .args(["-0", &pid.to_string()])
-                    .output();
-                if let Ok(output) = result {
-                    if !output.status.success() {
-                        // Process not running — stale lock
-                        return true;
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, assume stale if lock is older than 10 minutes
-                if let Ok(meta) = std::fs::metadata(&lock_path) {
-                    if let Ok(modified) = meta.modified() {
-                        if let Ok(elapsed) = modified.elapsed() {
-                            return elapsed.as_secs() > 600;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-/// Clean up stale lock if detected.
-pub fn cleanup_stale_lock(index_dir: &Path) {
-    if is_lock_stale(index_dir) {
-        release_lock(index_dir);
-    }
+    Ok(lock_file)
+    // Lock is released automatically when `lock_file` is dropped
 }
 
 #[cfg(test)]
@@ -303,14 +248,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lock_lifecycle() {
+    fn test_lock_acquire_and_drop() {
         let dir = tempfile::tempdir().unwrap();
         let idx_dir = dir.path().join(".instagrep");
 
-        let _lock = acquire_lock(&idx_dir).unwrap();
+        let lock = acquire_lock(&idx_dir).unwrap();
         assert!(idx_dir.join(".lock").exists());
-
-        release_lock(&idx_dir);
-        assert!(!idx_dir.join(".lock").exists());
+        drop(lock); // flock released on drop
     }
 }
