@@ -1,6 +1,6 @@
 [package]
 name = "instagrep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Instant Grep — blazing-fast regex search via sparse n-gram inverted index. Open-source reimplementation of Cursor's Fast Regex Search with built-in MCP server for AI coding tools."

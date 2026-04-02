@@ -42,26 +42,11 @@ pub fn extract_sparse_ngrams(content: &[u8]) -> Vec<u64> {
         .map(|i| bigram_weight(content[i], content[i + 1]))
         .collect();
 
-    // Only start n-grams at "interesting" positions — where the bigram weight
-    // is above the 60th percentile. Skips common pairs like "th", "  ", "in"
-    // while keeping enough n-grams for reliable candidate filtering.
-    // Uses O(n) selection instead of O(n log n) sort.
-    let weight_threshold = if num_bigrams > 4 {
-        let mut w = weights.clone();
-        let p60 = w.len() * 3 / 5;
-        w.select_nth_unstable(p60);
-        w[p60]
-    } else {
-        0
-    };
-
+    // Index stores ALL sparse n-grams >= 3 bytes at every position.
+    // No weight threshold on indexing — guarantees zero false negatives.
+    // The query side applies selectivity filtering instead.
     for start in 0..num_bigrams {
         let start_weight = weights[start];
-
-        // Skip low-weight starting positions (common character pairs like "th", "  ")
-        if start_weight <= weight_threshold {
-            continue;
-        }
 
         // Try extending: track the minimum edge condition
         // We need start_weight > all internal bigrams AND end_weight > all internal bigrams
@@ -81,7 +66,7 @@ pub fn extract_sparse_ngrams(content: &[u8]) -> Vec<u64> {
             if start_weight > max_internal && end_weight > max_internal {
                 let ngram = &content[start..end_bigram_idx + 2];
                 // Cap n-gram length to avoid very long ones (diminishing returns)
-                if ngram.len() <= MAX_NGRAM_LEN {
+                if ngram.len() >= 3 && ngram.len() <= MAX_NGRAM_LEN {
                     hashes.push(ngram_hash(ngram));
                 }
             }
@@ -102,7 +87,7 @@ pub fn extract_sparse_ngrams(content: &[u8]) -> Vec<u64> {
 
 /// Extract sparse n-grams and return them as (hash, ngram_string) for debugging/testing.
 /// Uses the SAME filtering as the production `extract_sparse_ngrams`:
-/// skips bigrams, applies p60 weight threshold, caps at MAX_NGRAM_LEN.
+/// skips bigrams, caps at MAX_NGRAM_LEN. Matches production exactly.
 pub fn extract_sparse_ngrams_debug(content: &[u8]) -> Vec<(u64, Vec<u8>)> {
     if content.len() < 2 {
         return vec![];
@@ -114,22 +99,8 @@ pub fn extract_sparse_ngrams_debug(content: &[u8]) -> Vec<(u64, Vec<u8>)> {
         .map(|i| bigram_weight(content[i], content[i + 1]))
         .collect();
 
-    // Same p60 threshold as production
-    let weight_threshold = if num_bigrams > 4 {
-        let mut w = weights.clone();
-        let p60 = w.len() * 3 / 5;
-        w.select_nth_unstable(p60);
-        w[p60]
-    } else {
-        0
-    };
-
     for start in 0..num_bigrams {
         let start_weight = weights[start];
-
-        if start_weight <= weight_threshold {
-            continue;
-        }
 
         // Skip standalone bigrams (same as production)
         let mut max_internal: u32 = 0;

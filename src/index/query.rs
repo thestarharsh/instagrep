@@ -125,30 +125,13 @@ fn extract_covering_ngrams(literal: &[u8]) -> Vec<u64> {
         .map(|i| bigram_weight(literal[i], literal[i + 1]))
         .collect();
 
-    // Generate n-grams matching the index: skip standalone bigrams,
-    // skip low-weight start positions (same threshold as builder).
+    // Generate covering n-grams from the literal.
+    // No weight threshold — we want the most selective n-grams possible.
+    // Skip standalone bigrams (not selective enough).
     let mut ngrams: Vec<(u64, usize)> = Vec::new(); // (hash, length)
-
-    // Use same p60 threshold as the index builder
-    let weight_threshold = if num_bigrams > 4 {
-        let mut w = weights.clone();
-        let p60 = w.len() * 3 / 5;
-        w.select_nth_unstable(p60);
-        w[p60]
-    } else {
-        0
-    };
 
     for start in 0..num_bigrams {
         let start_weight = weights[start];
-
-        // Skip low-weight positions (same as index builder)
-        if start_weight <= weight_threshold {
-            continue;
-        }
-
-        // Skip standalone bigrams (not stored in index)
-        // Only generate n-grams >= 3 bytes
         let mut max_internal: u32 = 0;
         for end_bigram_idx in (start + 1)..num_bigrams {
             if end_bigram_idx > start + 1 {
@@ -266,36 +249,33 @@ fn find_candidates_inner(
         return None;
     }
 
-    // Intersect posting lists for all covering n-grams
-    let mut posting_lists: Vec<Vec<u32>> = Vec::new();
+    // Look up each covering n-gram and use the SMALLEST posting list.
+    // We use the single most selective n-gram rather than intersecting all,
+    // because sparse n-grams depend on file context — the same literal
+    // can produce different n-grams in different files. Intersection
+    // would cause false negatives. Using the smallest list gives the
+    // best pruning without missing any files.
+    let mut best: Option<Vec<u32>> = None;
     for hash in &covering {
         if let Some(list) = reader.lookup(*hash) {
-            posting_lists.push(list);
-        }
-        // N-gram not in index: could mean no file has it, OR it was below
-        // the indexing weight threshold. Can't tell — skip this n-gram.
-        // If ALL n-grams are missing, we'll fall through to full scan.
-    }
-
-    if posting_lists.is_empty() {
-        return None;
-    }
-
-    // Intersect all posting lists (start with smallest for efficiency)
-    posting_lists.sort_by_key(|l| l.len());
-
-    let mut result = posting_lists[0].clone();
-    for list in &posting_lists[1..] {
-        result = intersect_sorted(&result, list);
-        if result.is_empty() {
-            return Some(vec![]);
+            match &best {
+                None => best = Some(list),
+                Some(current) if list.len() < current.len() => best = Some(list),
+                _ => {}
+            }
         }
     }
 
-    Some(result)
+    best.or_else(|| {
+        // No n-grams found at all — can't optimize
+        None
+    })
 }
 
 /// Intersect two sorted lists of u32.
+/// Currently unused in production (we pick the smallest posting list instead of
+/// intersecting), but kept for tests and potential future multi-literal optimization.
+#[allow(dead_code)]
 fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut result = Vec::new();
     let mut i = 0;
