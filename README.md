@@ -320,13 +320,13 @@ instagrep search -q "pattern" && echo "found" || echo "not found"
 - Run `instagrep clear` to remove a project's index.
 
 ### Weak patterns
-Patterns with only common characters (e.g., `hello`, `for`, `the`) may produce n-grams that were below the indexing weight threshold. In this case, the index gracefully falls back to scanning all indexed files — never returns wrong results, just doesn't get the index speedup.
+Patterns with only common characters (e.g., `hello`, `for`, `the`) may not produce any sparse n-grams >= 3 bytes. In this case, the index gracefully falls back to scanning all indexed files — never returns wrong results, just doesn't get the index speedup.
 
 ## Technical Details
 
 ### Sparse N-Gram Algorithm
 
-- **Index time (`build_all`)**: extract n-grams (3-8 bytes) at positions where the starting bigram weight is above the 60th percentile. Weight is based on character-class rarity in source code.
+- **Index time (`build_all`)**: extract ALL sparse n-grams >= 3 bytes at every position. No weight threshold — guarantees zero false negatives. The sparse n-gram condition (edge bigrams must outweigh all internal bigrams) provides natural selectivity.
 - **Query time (`build_covering`)**: parse regex to extract literals, generate matching n-grams using the same weight function, look up in the index.
 - **Hash function**: FNV-1a 64-bit (stable across all platforms and versions forever).
 - **Posting lists**: delta-encoded + varint-compressed (5-8x smaller than raw u32 arrays).
